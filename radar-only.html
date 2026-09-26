@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Varia stationary speed logger</title>
+<style>
+:root{color-scheme:dark;font:16px system-ui;background:#101b28;color:#f5f7fa}
+body{max-width:850px;margin:auto;padding:18px}
+h1{font-size:1.5rem}
+button{font:inherit;padding:12px;margin:4px 4px 4px 0;border:0;border-radius:9px;background:#35c0a2;color:#061915;font-weight:700}
+button:disabled{opacity:.5}
+.card{background:#1b2c3d;border-radius:14px;padding:16px;margin:12px 0}
+.muted{color:#b5c3cf}.warning{color:#ffcd77}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse}
+td,th{padding:8px;border-bottom:1px solid #405064;text-align:left}
+</style>
+</head>
+<body>
+<h1>Varia stationary speed logger</h1>
+<p class="muted">Live Varia targets, two speed estimates and a downloadable CSV. Keep Bluefy open in the foreground.</p>
+<div class="card">
+  <strong>Status:</strong> <span id="status">Ready</span><br>
+  <button id="connect">Connect Varia</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <p class="muted">Varia speed is reported by the radar. Range speed is fitted from a target’s changing range while stationary; it appears after sufficient readings. Both are estimates.</p>
+</div>
+<div class="card">
+  <h2>Live targets</h2>
+  <div class="scroll"><table>
+    <thead><tr><th>ID</th><th>Range</th><th>Varia speed</th><th>Range speed</th><th>Fit R²</th></tr></thead>
+    <tbody id="targets"><tr><td colspan="5">No radar targets yet</td></tr></tbody>
+  </table></div>
+</div>
+<div class="card">
+  <h2>Save readings</h2>
+  <p id="counts">0 readings</p>
+  <button id="saveCsv">Save CSV</button>
+  <p class="warning">Save before closing or refreshing this page. Check Bluefy Downloads or the Files app for the CSV.</p>
+</div>
+<script>
+(()=>{'use strict';
+const SERVICE='6a4e3200-667b-11e3-949a-0800200c9a66',RADAR='6a4e3203-667b-11e3-949a-0800200c9a66';
+const $=id=>document.getElementById(id);
+let device=null,characteristic=null,rows=[],histories=new Map(),latest=new Map();
+const session=new Date().toISOString().replace(/[:.]/g,'-');
+const header=['timestamp_local','epoch_s','monotonic_s','target_id','slant_range_m','varia_speed_kmh','trajectory_speed_kmh','trajectory_r2','trajectory_n','raw_packet_hex'];
+function status(message){$('status').textContent=message}
+function fit(hist){
+  const p=hist.filter(x=>x.r>=20&&x.r<=100);
+  if(p.length<8||p.at(-1).t-p[0].t<800)return null;
+  const t0=p[0].t,T=p.map(x=>(x.t-t0)/1000),R=p.map(x=>x.r);
+  const mt=T.reduce((a,b)=>a+b,0)/p.length,mr=R.reduce((a,b)=>a+b,0)/p.length;
+  let st=0,sr=0,ss=0;
+  for(let i=0;i<p.length;i++){st+=(T[i]-mt)**2;sr+=(T[i]-mt)*(R[i]-mr);ss+=(R[i]-mr)**2}
+  if(!st)return null;
+  const slope=sr/st,speed=-3.6*slope;
+  if(speed<5||speed>180)return null;
+  let residual=0;
+  for(let i=0;i<p.length;i++)residual+=(R[i]-mr-slope*(T[i]-mt))**2;
+  return {speed,r2:ss?1-residual/ss:1,n:p.length};
+}
+function render(){
+  const active=[...latest.values()].filter(x=>performance.now()-x.t<2500).sort((a,b)=>a.r-b.r);
+  $('targets').innerHTML=active.length?active.map(x=>`<tr><td>${x.id}</td><td>${x.r} m</td><td>${x.speed} km/h</td><td>${x.fit?x.fit.speed.toFixed(1)+' km/h':'collecting…'}</td><td>${x.fit?x.fit.r2.toFixed(2):'—'}</td></tr>`).join(''):'<tr><td colspan="5">No radar targets</td></tr>';
+  $('counts').textContent=`${rows.length} readings`;
+}
+function onRadar(event){
+  const data=new Uint8Array(event.target.value.buffer,event.target.value.byteOffset,event.target.value.byteLength);
+  if(!data.length||(data.length-1)%3){status('Unrecognised radar packet');return}
+  const now=performance.now(),wall=Date.now(),stamp=new Date(wall).toISOString();
+  const raw=[...data].map(x=>x.toString(16).padStart(2,'0')).join('');
+  for(let i=1;i<data.length;i+=3){
+    const [id,r,speed]=data.slice(i,i+3);
+    if(!r||!speed)continue;
+    let h=histories.get(id)||[];
+    if(h.length&&now-h.at(-1).t>2000)h=[];
+    h.push({t:now,r});h=h.filter(x=>now-x.t<=8000);histories.set(id,h);
+    const f=fit(h);latest.set(id,{id,r,speed,fit:f,t:now});
+    rows.push([stamp,(wall/1000).toFixed(3),(now/1000).toFixed(3),id,r,speed,f?f.speed.toFixed(2):'',f?f.r2.toFixed(4):'',f?f.n:'',raw]);
+  }
+  render();
+}
+async function connect(){
+  if(!navigator.bluetooth){status('Web Bluetooth unavailable. Open this HTTPS page in Bluefy.');return}
+  try{
+    status('Select your Varia…');
+    device=await navigator.bluetooth.requestDevice({filters:[{namePrefix:'Varia'},{namePrefix:'VARIA'},{namePrefix:'RVR'},{namePrefix:'RTL'}],optionalServices:[SERVICE]});
+    device.addEventListener('gattserverdisconnected',()=>{status('Varia disconnected');$('connect').disabled=false;$('disconnect').disabled=true;characteristic=null});
+    status('Connecting…');
+    const server=await device.gatt.connect(),service=await server.getPrimaryService(SERVICE);
+    characteristic=await service.getCharacteristic(RADAR);
+    characteristic.addEventListener('characteristicvaluechanged',onRadar);
+    await characteristic.startNotifications();
+    status('Recording: '+(device.name||'Varia'));
+    $('connect').disabled=true;$('disconnect').disabled=false;
+  }catch(e){status('Connection failed: '+e.message);$('connect').disabled=false}
+}
+function csv(){
+  const escape=v=>'"'+String(v??'').replace(/"/g,'""')+'"';
+  return [header,...rows].map(row=>row.map(escape).join(',')).join('\r\n')+'\r\n';
+}
+function saveCsv(){
+  const blob=new Blob([csv()],{type:'text/csv'}),a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download=`varia_readings_${session}.csv`;
+  document.body.append(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},60000);
+  status('Save requested. Check Bluefy Downloads / Files.');
+}
+$('connect').onclick=connect;
+$('disconnect').onclick=()=>{device?.gatt?.disconnect();status('Disconnected')};
+$('saveCsv').onclick=saveCsv;
+setInterval(render,1000);
+})();
+</script>
+</body>
+</html>
